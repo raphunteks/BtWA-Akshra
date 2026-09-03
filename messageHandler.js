@@ -1,15 +1,19 @@
 /**
  * ============================================================================
- * MESSAGEHANDLER.JS - LOGIC DISPATCHER & GEMINI AI CLINIC ASSISTANT
+ * MESSAGEHANDLER.JS - LOGIC DISPATCHER & SMART GEMINI AI CLINIC ASSISTANT
  * ============================================================================
- * Menangani parsing pesan masuk, simulasi pengetikan natural, session multi-turn
- * in-memory per kontak, preset perintah klinis, dan sinkronisasi log dua arah ke GAS.
+ * Menangani parsing pesan masuk, penanganan token anti-terpotong (Anti-Truncation),
+ * adaptor konfigurasi multi-model Google AI Studio, pembersih format WhatsApp,
+ * session multi-turn in-memory per kontak, dan sinkronisasi log dua arah ke GAS.
  * ============================================================================
  */
 
 const conversationSessions = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000; // Kadaluarsa sesi percakapan 30 menit
 
+/**
+ * Membersihkan format nomor telepon menjadi standar internasional WhatsApp JID.
+ */
 function sanitizeNumber(rawNumber) {
   let cleaned = String(rawNumber).replace(/\D/g, '');
   if (cleaned.startsWith('0')) {
@@ -32,6 +36,65 @@ function cleanExpiredSessions() {
   }
 }
 setInterval(cleanExpiredSessions, 10 * 60 * 1000);
+
+function formatForWhatsApp(text) {
+  if (!text) return '';
+  let formatted = String(text);
+
+  // 1. Ubah markdown double-asterisk **tebal** menjadi format WA *tebal*
+  formatted = formatted.replace(/\*\*(.*?)\*\*/g, '*$1*');
+
+  // 2. Ubah heading markdown (### Heading / ## Heading) menjadi format tebal kapital
+  formatted = formatted.replace(/^###\s*(.*)$/gm, '\n*$1*');
+  formatted = formatted.replace(/^##\s*(.*)$/gm, '\n*$1*');
+  formatted = formatted.replace(/^#\s*(.*)$/gm, '\n*$1*');
+
+  // 3. Rapikan daftar bullet point (- item atau * item) menjadi bullet simbol (• item)
+  formatted = formatted.replace(/^[\*\-]\s+(.*)$/gm, '• $1');
+
+  // 4. Bersihkan baris kosong berlebih (maksimal 2 baris baru berurutan)
+  formatted = formatted.replace(/\n{3,}/g, '\n\n');
+
+  return formatted.trim();
+}
+
+function getModelGenerationConfig(modelName) {
+  const model = String(modelName || 'gemini-3.5-flash').toLowerCase().trim();
+
+  // Model Deep Clinical Reasoning / Pro (Memerlukan token ruang lebih luas)
+  if (model.includes('3.1-pro') || model.includes('2.5-pro') || model.includes('deep-research')) {
+    return {
+      temperature: 0.5,
+      maxOutputTokens: 3500,
+      topP: 0.9
+    };
+  }
+
+  // Model Generasi Baru Ultra-Fast (Gemini 3.8 Flash, 3.7 Flash)
+  if (model.includes('3.8-flash') || model.includes('3.7-flash') || model.includes('3.6-flash')) {
+    return {
+      temperature: 0.6,
+      maxOutputTokens: 2500,
+      topP: 0.95
+    };
+  }
+
+  // Model Open Architecture Gemma (Gemma 4 31B / 26B)
+  if (model.includes('gemma-4')) {
+    return {
+      temperature: 0.65,
+      maxOutputTokens: 2200,
+      topP: 0.9
+    };
+  }
+
+  // Default Standard Workhorse (Gemini 3.5 Flash / Flash Lite / Gemini 2.5 Flash)
+  return {
+    temperature: 0.65,
+    maxOutputTokens: 2048,
+    topP: 0.92
+  };
+}
 
 async function syncLogToGAS(gasApiUrl, payload) {
   if (!gasApiUrl) return;
@@ -56,14 +119,18 @@ async function askGeminiClinic(apiKey, model, conversationHistory) {
     ':generateContent?key=' +
     encodeURIComponent(apiKey);
 
+  const genConfig = getModelGenerationConfig(selectedModel);
+
   const systemInstructionText = 
-    'Anda adalah Asisten Medis Virtual Resmi Klinik Pintar NovaCare. ' +
-    'Karakter Anda: Sangat santun, empatik, berbasis data medis modern, dan responsif. ' +
-    'Pedoman Konsultasi Pasien:\n' +
-    '1. Berikan edukasi kesehatan awal serta arahan pemeriksaan yang jelas dan menenangkan.\n' +
-    '2. Selalu sertakan catatan etis bahwa anjuran ini merupakan panduan triase awal dan BUKAN pengganti diagnosis langsung dari dokter spesialis.\n' +
-    '3. Jika pasien mengalami kondisi darurat (nyeri dada hebat, sesak nafas akut, pendarahan), anjurkan segera ke Unit Gawat Darurat (UGD) terdekat.\n' +
-    '4. Layanan klinik: Poli Spesialis Jantung Bionik, Bed Pod Rawat Inap Pintar, Saraf, Anak, Laboratorium Digital, dan Farmasi Siaga 24 Jam.';
+    'Anda adalah "NovaCare Medical AI", Asisten Medis Virtual Resmi Klinik Pintar NovaCare. ' +
+    'Karakter: Sangat cerdas, santun, hangat, empatik, berbasis data medis klinis terpercaya, dan to-the-point.\n\n' +
+    'PEDOMAN RESPON KONSULTASI:\n' +
+    '1. Berikan penjelasan kesehatan awal, saran perawatan mandiri ringan, dan anjuran pemeriksaan yang relevan secara jelas dan menenangkan.\n' +
+    '2. HINDARI MEMOTONG JAWABAN: Pastikan seluruh penjelasan, tips, dan anjuran Anda selesai tuntas sampai akhir kalimat. Jangan biarkan kalimat menggantung.\n' +
+    '3. STRUKTUR FORMAT WHATSAPP: Sajikan informasi dengan ringkas, terstruktur menggunakan bullet poin (•), dan hindari paragraf panjang yang melelahkan di layar ponsel.\n' +
+    '4. PROTOKOL KONDISI DARURAT: Jika pasien mengeluhkan gejala darurat (nyeri dada tembus ke punggung, sesak napas berat, kejang, muntah darah, kehilangan kesadaran), tekankan SEGERA menuju Unit Gawat Darurat (UGD) terdekat.\n' +
+    '5. CATATAN ETIS MEDIS: Selalu sertakan catatan ramah di akhir bahwa jawaban ini merupakan panduan triase edukasi awal dan BUKAN pengganti diagnosis langsung dari dokter spesialis.\n' +
+    '6. FASILITAS NOVACARE: Poliklinik Spesialis Jantung Bionik, Bed Pod Rawat Inap Pintar, Saraf & Telemetri, Anak, Laboratorium Cepat, dan Farmasi 24 Jam.';
 
   const requestBody = {
     contents: conversationHistory,
@@ -71,8 +138,9 @@ async function askGeminiClinic(apiKey, model, conversationHistory) {
       parts: [{ text: systemInstructionText }]
     },
     generationConfig: {
-      temperature: 0.65,
-      maxOutputTokens: 850
+      temperature: genConfig.temperature,
+      maxOutputTokens: genConfig.maxOutputTokens,
+      topP: genConfig.topP
     }
   };
 
@@ -88,11 +156,20 @@ async function askGeminiClinic(apiKey, model, conversationHistory) {
   }
 
   const data = await res.json();
-  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!reply) {
+  const candidate = data.candidates?.[0];
+
+  // Periksa apakah respon terpotong oleh sistem keamanan atau token limit
+  if (candidate?.finishReason && candidate.finishReason !== 'STOP') {
+    console.warn('[Gemini Warning]: Alasan selesai generasi:', candidate.finishReason);
+  }
+
+  const rawReply = candidate?.content?.parts?.[0]?.text;
+  if (!rawReply) {
     throw new Error('Respon teks Gemini kosong');
   }
-  return reply.trim();
+
+  // Bersihkan dan adaptasikan teks agar tampil sempurna di WhatsApp
+  return formatForWhatsApp(rawReply);
 }
 
 async function handleIncomingMessage(sock, msgUpdate, config) {
@@ -118,6 +195,7 @@ async function handleIncomingMessage(sock, msgUpdate, config) {
     const senderPhone = remoteJid.replace('@s.whatsapp.net', '');
     console.log('[Pesan Masuk]: Dari:', senderPhone, '| Konten:', text);
 
+    // Sinkronisasi pesan masuk ke Google Sheets (non-blocking)
     syncLogToGAS(config.gasApiUrl, {
       clientId: config.clientId,
       senderNumber: senderPhone,
@@ -147,7 +225,7 @@ async function handleIncomingMessage(sock, msgUpdate, config) {
         '🏥 *Poli Umum & Ranap Pod*: Siaga 24 Jam Non-Stop\n' +
         '🩺 *Spesialis Jantung Bionik*: Senin - Sabtu (08.00 - 18.00 WITA)\n' +
         '🧠 *Spesialis Saraf & Telemetri*: Senin - Jumat (09.00 - 16.00 WITA)\n' +
-        '💊 *Farmasi Dispenser Digital*: Buka 24 Jam.';
+        '💊 *Farmasi Dispenser Digital*: Buka 24 Jam Non-Stop.';
     } else if (lowerText === '#layanan') {
       commandReply = 
         '*FASILITAS MEDIS UNGGULAN NOVACARE*\n\n' +
@@ -155,7 +233,7 @@ async function handleIncomingMessage(sock, msgUpdate, config) {
         '2. Telemetri Klinis Real-Time Terhubung WhatsApp\n' +
         '3. Laboratorium Analisis Darah & Bionik Cepat\n' +
         '4. Konsultasi AI Generatif Pre-Triage 24 Jam\n' +
-        '5. Layanan E-Billing & Antar Resep Farmasi';
+        '5. Layanan E-Billing & Antar Resep Farmasi Cepat';
     } else if (lowerText === '#lokasi') {
       commandReply = 
         '*LOKASI & KONTAK RESMI NOVACARE CLINIC*\n\n' +
@@ -170,7 +248,7 @@ async function handleIncomingMessage(sock, msgUpdate, config) {
     }
 
     if (commandReply) {
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, 900));
       await sock.sendMessage(remoteJid, { text: commandReply });
       await sock.sendPresenceUpdate('paused', remoteJid);
 
@@ -199,30 +277,41 @@ async function handleIncomingMessage(sock, msgUpdate, config) {
     }
     userSession.lastSeen = Date.now();
 
+    // Masukkan pesan user ke histori sesi
     userSession.history.push({
       role: 'user',
       parts: [{ text: text }]
     });
 
-    // Batasi riwayat maksimal 10 giliran pesan terakhir agar hemat memori RAM
-    if (userSession.history.length > 10) {
-      userSession.history = userSession.history.slice(-10);
+    // Batasi riwayat maksimal 8 giliran pesan terakhir agar hemat memori RAM dan menjaga fokus konteks
+    if (userSession.history.length > 8) {
+      userSession.history = userSession.history.slice(-8);
     }
+
+    // Jaga indikator pengetikan WhatsApp tetap aktif selama AI memproses
+    const typingKeepAlive = setInterval(async () => {
+      try {
+        await sock.sendPresenceUpdate('composing', remoteJid);
+      } catch (e) {}
+    }, 4000);
 
     let aiReply = '';
     try {
       aiReply = await askGeminiClinic(config.geminiApiKey, config.geminiModel, userSession.history);
 
+      // Simpan jawaban lengkap AI ke dalam histori sesi
       userSession.history.push({
         role: 'model',
         parts: [{ text: aiReply }]
       });
     } catch (aiErr) {
       console.error('[Gemini AI Processing Error]:', aiErr.message);
-      aiReply = 'Mohon maaf, asisten AI kami sedang memproses lonjakan antrean. Silakan ketik kembali keluhan Anda.';
+      aiReply = 'Mohon maaf, asisten AI kami sedang memproses lonjakan konsultasi. Silakan ulangi kembali pertanyaan Anda.';
+    } finally {
+      clearInterval(typingKeepAlive);
     }
 
-    await new Promise((r) => setTimeout(r, 1400));
+    await new Promise((r) => setTimeout(r, 600));
     await sock.sendMessage(remoteJid, { text: aiReply });
     await sock.sendPresenceUpdate('paused', remoteJid);
 
@@ -242,5 +331,6 @@ async function handleIncomingMessage(sock, msgUpdate, config) {
 
 module.exports = {
   handleIncomingMessage,
-  sanitizeNumber
+  sanitizeNumber,
+  formatForWhatsApp
 };

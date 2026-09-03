@@ -8,7 +8,7 @@
  */
 
 const conversationSessions = new Map();
-const SESSION_TTL_MS = 30 * 60 * 1000; // Kadaluarsa sesi percakapan 30 menit
+const SESSION_TTL_MS = 30 * 60 * 1000;
 
 function sanitizeNumber(rawNumber) {
   let cleaned = String(rawNumber).replace(/\D/g, '');

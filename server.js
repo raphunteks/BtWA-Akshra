@@ -3,7 +3,8 @@
  * SERVER.JS - ENTRY POINT BACKEND WA BOT MULTI-CLIENT (RAILWAY INSTANCE)
  * ============================================================================
  * Mengelola Express Server, Real-Time Socket.IO Server untuk Live QR Streaming,
- * Sesi Koneksi Baileys Multi-Device, Endpoint Dispatcher Pesan, dan Queue Worker.
+ * Baileys Multi-Device Engine dengan Session Guard Anti-Loop Reconnect,
+ * REST API Dispatcher Pesan, dan Background Broadcast Worker.
  * ============================================================================
  */
 
@@ -57,27 +58,49 @@ let currentQrDataUrl = null;
 let isInitializing = false;
 const serverStartTime = Date.now();
 
-// Logger Silent agar output log di terminal Railway tetap bersih dan terukur
+// Logger Silent agar log output Railway tetap bersih dari noise data stream Baileys
 const logger = pino({ level: 'silent' });
 
+/**
+ * Memeriksa apakah kredensial autentikasi WhatsApp yang sah sudah tersimpan di disk.
+ * Mengembalikan true hanya jika creds.json ada dan akun telah terdaftar (registered).
+ */
+function hasExistingSession() {
+  try {
+    const credsPath = path.join(SESSION_DIR, 'creds.json');
+    if (!fs.existsSync(credsPath)) return false;
+    const rawData = fs.readFileSync(credsPath, 'utf8');
+    const parsed = JSON.parse(rawData);
+    // Baileys menyimpan flag registered: true atau properti user/me saat berhasil login
+    return Boolean(parsed && (parsed.registered === true || parsed.me));
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * Membersihkan folder kredensial sesi jika terjadi logout atau reset manual.
+ */
 function cleanSessionDirectory() {
   try {
     if (fs.existsSync(SESSION_DIR)) {
       fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-      console.log('[Auth Sesi]: Direktori sesi lama berhasil dibersihkan.');
+      console.log('[Auth Sesi]: Direktori kredensial lama berhasil dibersihkan.');
     }
   } catch (err) {
-    console.error('[Auth Sesi]: Gagal membersihkan folder sesi:', err.message);
+    console.error('[Auth Sesi]: Gagal membersihkan direktori sesi:', err.message);
   }
 }
 
 io.on('connection', (socket) => {
-  // Kirimkan status aktif saat ini ke browser client yang baru terhubung
+  const sessionExists = hasExistingSession();
+
   if (botStatus === 'CONNECTED') {
     socket.emit('ready', {
       clientId: CLIENT_ID,
       status: 'CONNECTED',
-      message: 'WhatsApp Bot sudah aktif dan terautentikasi'
+      message: 'WhatsApp Bot aktif dan terautentikasi',
+      user: sock?.user
     });
   } else if (botStatus === 'SCAN_QR' && currentQrDataUrl) {
     socket.emit('qr', {
@@ -90,11 +113,12 @@ io.on('connection', (socket) => {
     socket.emit('status', {
       botStatus: botStatus,
       status: botStatus,
-      clientId: CLIENT_ID
+      clientId: CLIENT_ID,
+      hasSession: sessionExists
     });
   }
 
-  // Listener jika antarmuka web meminta refresh atau polling QR
+  // Listener ketika web portal meminta refresh atau pembuatan QR baru
   socket.on('request_qr', () => {
     if (botStatus === 'CONNECTED') {
       socket.emit('ready', { clientId: CLIENT_ID, status: 'CONNECTED' });
@@ -106,24 +130,37 @@ io.on('connection', (socket) => {
         timestamp: Date.now()
       });
     } else {
-      socket.emit('status', {
-        botStatus: botStatus,
-        status: botStatus,
-        clientId: CLIENT_ID
-      });
+      // Jika bot belum aktif dan belum ada QR, picu pembuatan koneksi secara aman
+      connectToWhatsApp(false, true);
     }
   });
 
   socket.on('disconnect', () => {
-    // Sesi socket client terputus dengan aman
+    // Sesi socket client terputus
   });
 });
 
-async function connectToWhatsApp(forceClean = false) {
+/**
+ * Inisialisasi engine Baileys dengan proteksi Session Guard Anti-Loop Reconnect.
+ * @param {boolean} forceClean - Bersihkan kredensial sebelum inisialisasi.
+ * @param {boolean} isUserTriggered - Diinisiasi atas permintaan pengguna/web (misal scan QR).
+ */
+async function connectToWhatsApp(forceClean = false, isUserTriggered = false) {
   if (isInitializing) {
-    console.log('[Baileys Init]: Proses inisialisasi sedang berjalan, melewati request duplikat.');
+    console.log('[Baileys Init]: Inisialisasi sedang berjalan, melewati pemanggilan duplikat.');
     return;
   }
+
+  const sessionAlreadyExists = hasExistingSession();
+
+  // GUARD UTAMA: Jika tidak ada sesi tersimpan dan BUKAN dipicu oleh aksi pengguna,
+  // jangan lakukan inisialisasi background untuk mencegah perulangan reconnect.
+  if (!sessionAlreadyExists && !isUserTriggered && !forceClean) {
+    console.log(`[Session Guard]: Client ID [${CLIENT_ID}] belum memiliki sesi terdaftar. Menunggu trigger scan QR dari dashboard.`);
+    botStatus = 'DISCONNECTED';
+    return;
+  }
+
   isInitializing = true;
 
   try {
@@ -135,15 +172,23 @@ async function connectToWhatsApp(forceClean = false) {
       fs.mkdirSync(SESSION_DIR, { recursive: true });
     }
 
+    // Tutup socket lama secara bersih jika masih menggantung
+    if (sock) {
+      try {
+        sock.ev.removeAllListeners();
+        sock.end(undefined);
+      } catch (e) {}
+      sock = null;
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
-    // Ambil versi Baileys stabil dengan fallback
     let version = [2, 3000, 1015901307];
     try {
       const fetched = await fetchLatestBaileysVersion();
       if (fetched && fetched.version) version = fetched.version;
     } catch (vErr) {
-      console.log('[Baileys Version]: Fallback ke versi default:', version.join('.'));
+      console.log('[Baileys Version]: Menggunakan versi stabil bawaan:', version.join('.'));
     }
 
     sock = makeWASocket({
@@ -169,7 +214,7 @@ async function connectToWhatsApp(forceClean = false) {
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      // 1. QR Code Baru Dihasilkan dari Baileys Engine
+      // 1. QR Code Baru Dihasilkan dari Baileys
       if (qr) {
         currentQrRaw = qr;
         botStatus = 'SCAN_QR';
@@ -183,9 +228,8 @@ async function connectToWhatsApp(forceClean = false) {
             }
           });
 
-          console.log('[QR Baileys]: QR Code asli berhasil di-generate. Memancarkan via Socket.IO...');
+          console.log('[QR Baileys]: Kode QR asli berhasil dibuat. Mengirimkan ke Socket.IO...');
 
-          // Pancarkan event 'qr' secara instan ke browser frontend (index.html)
           io.emit('qr', {
             qrDataUrl: currentQrDataUrl,
             qrRaw: qr,
@@ -197,30 +241,47 @@ async function connectToWhatsApp(forceClean = false) {
         }
       }
 
+      // 2. Event Koneksi Terputus
       if (connection === 'close') {
         isInitializing = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const sessionRegistered = hasExistingSession();
+
         botStatus = 'DISCONNECTED';
         currentQrRaw = null;
         currentQrDataUrl = null;
 
-        console.log('[Connection Closed]: Kode status:', statusCode, '| Reconnect:', shouldReconnect);
+        console.log(`[Connection Closed]: Kode status: ${statusCode} | Sesi terdaftar: ${sessionRegistered}`);
+
         io.emit('status', {
           botStatus: 'DISCONNECTED',
           status: 'DISCONNECTED',
-          clientId: CLIENT_ID
+          clientId: CLIENT_ID,
+          hasSession: sessionRegistered
         });
 
+        // KASUS A: Belum pernah ada sesi tersimpan (Client baru / belum scan)
+        // DILARANG melakukan reconnect otomatis agar terminal tidak spam loop!
+        if (!sessionRegistered) {
+          console.log('[Session Guard]: Instance belum terautentikasi. Menghentikan reconnect otomatis. Menunggu scan QR berikutnya.');
+          return;
+        }
+
+        // KASUS B: Sesi resmi di-logout dari ponsel (HTTP 401)
         if (statusCode === DisconnectReason.loggedOut) {
-          console.log('[Logged Out]: Sesi kadaluarsa. Membersihkan kredensial sesi lama...');
+          console.log('[Logged Out]: Kredensial telah logout dari perangkat ponsel. Membersihkan sesi...');
           cleanSessionDirectory();
-          setTimeout(() => connectToWhatsApp(true), 3000);
-        } else if (shouldReconnect) {
-          setTimeout(() => connectToWhatsApp(false), 5000);
+          return;
+        }
+
+        // KASUS C: Sesi valid ada, tetapi koneksi terputus sementara (jaringan/restart server)
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        if (shouldReconnect && sessionRegistered) {
+          console.log('[Auto-Reconnect]: Sesi valid terdeteksi. Menghubungkan ulang dalam 5 detik...');
+          setTimeout(() => connectToWhatsApp(false, false), 5000);
         }
       }
-      // 3. Koneksi Berhasil Terbuka (Connected)
+      // 3. Event Koneksi Berhasil Terbuka (Connected)
       else if (connection === 'open') {
         isInitializing = false;
         botStatus = 'CONNECTED';
@@ -233,7 +294,6 @@ async function connectToWhatsApp(forceClean = false) {
         console.log(' Phone      :', sock?.user?.id || 'Connected');
         console.log('====================================================');
 
-        // Pancarkan sinyal ready ke modal index.html & halaman /qr
         io.emit('ready', {
           clientId: CLIENT_ID,
           status: 'CONNECTED',
@@ -256,25 +316,23 @@ async function connectToWhatsApp(forceClean = false) {
   } catch (error) {
     isInitializing = false;
     console.error('[Baileys Init Error]:', error);
-    setTimeout(() => connectToWhatsApp(false), 10000);
+    // Hanya retry jika memang memiliki sesi terdaftar
+    if (hasExistingSession()) {
+      setTimeout(() => connectToWhatsApp(false, false), 10000);
+    }
   }
 }
 
-/**
- * ============================================================================
- * REST API ENDPOINTS
- * ============================================================================
- */
-
 app.get('/', (req, res) => {
   const uptimeSeconds = Math.floor((Date.now() - serverStartTime) / 1000);
+  const sessionExists = hasExistingSession();
   res.status(200).json({
     status: 'success',
     clientId: CLIENT_ID,
     botStatus: botStatus,
+    hasSession: sessionExists,
     uptime: uptimeSeconds + 's',
     model: GEMINI_MODEL,
-    hasSocketIo: true,
     hasActiveQr: Boolean(currentQrDataUrl),
     timestamp: new Date().toISOString()
   });
@@ -282,11 +340,18 @@ app.get('/', (req, res) => {
 
 app.get('/api/qr', (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+
+  // Jika bot belum aktif dan belum ada QR, trigger pembuatan QR atas permintaan API
+  if (botStatus === 'DISCONNECTED' && !currentQrDataUrl && !isInitializing) {
+    connectToWhatsApp(false, true);
+  }
+
   res.status(200).json({
     success: true,
     status: 'success',
     clientId: CLIENT_ID,
     botStatus: botStatus,
+    hasSession: hasExistingSession(),
     hasQr: Boolean(currentQrDataUrl),
     qrDataUrl: currentQrDataUrl,
     qrRaw: currentQrRaw,
@@ -295,22 +360,28 @@ app.get('/api/qr', (req, res) => {
 });
 
 app.all(['/reset', '/api/reset-session'], async (req, res) => {
-  console.log('[Manual Reset Triggered]: Mereset sesi Baileys...');
+  console.log('[Manual Reset Triggered]: Membersihkan sesi dan meminta QR baru...');
   try {
     if (sock) {
-      try { sock.end(new Error('Reset by operator')); } catch (e) {}
+      try {
+        sock.ev.removeAllListeners();
+        sock.end(undefined);
+      } catch (e) {}
+      sock = null;
     }
     cleanSessionDirectory();
     botStatus = 'DISCONNECTED';
     currentQrRaw = null;
     currentQrDataUrl = null;
-    io.emit('status', { botStatus: 'DISCONNECTED', status: 'DISCONNECTED', clientId: CLIENT_ID });
-    setTimeout(() => connectToWhatsApp(true), 2000);
+    isInitializing = false;
+
+    io.emit('status', { botStatus: 'DISCONNECTED', status: 'DISCONNECTED', clientId: CLIENT_ID, hasSession: false });
+    setTimeout(() => connectToWhatsApp(true, true), 1500);
 
     if (req.path.startsWith('/api/')) {
       return res.status(200).json({
         success: true,
-        message: 'Sesi dibersihkan. Memulai ulang Baileys untuk membuat QR baru...'
+        message: 'Sesi berhasil dibersihkan. Memulai ulang Baileys untuk menghasilkan QR baru...'
       });
     }
     return res.redirect('/qr');
@@ -324,6 +395,11 @@ app.all(['/reset', '/api/reset-session'], async (req, res) => {
 
 app.get('/qr', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
+
+  // Jika belum aktif, picu pembuatan QR atas permintaan user membuka halaman ini
+  if (botStatus === 'DISCONNECTED' && !currentQrDataUrl && !isInitializing) {
+    connectToWhatsApp(false, true);
+  }
 
   res.send(`
     <!DOCTYPE html>
@@ -524,12 +600,12 @@ app.get('/qr', (req, res) => {
             statusText.innerText = 'Online & Terhubung';
           } else if (data.botStatus === 'DISCONNECTED') {
             statusDot.className = 'dot disconnected';
-            statusText.innerText = 'Menghubungkan Ulang...';
-            loadingText.innerText = 'Menunggu server membuat kode QR baru...';
+            statusText.innerText = data.hasSession ? 'Menghubungkan Ulang...' : 'Standby (Menunggu Scan)';
+            loadingText.innerText = 'Menunggu pembuatan kode QR Baileys...';
           }
         });
 
-        // Polling Fallback langsung ke API /api/qr
+        // Polling HTTP Fallback ke /api/qr
         setInterval(function() {
           fetch('/api/qr?t=' + Date.now())
             .then(r => r.json())
@@ -599,14 +675,14 @@ async function startBroadcastQueueWorker() {
           const target = sanitizeNumber(item.targetNumber);
           const content = item.content;
 
-          // Jitter Delay acak 6 - 11 detik untuk pencegahan banned WhatsApp
+          // Jitter Delay acak 6 - 11 detik untuk proteksi anti-banned WhatsApp
           const delayMs = Math.floor(Math.random() * (11000 - 6000 + 1)) + 6000;
           await new Promise((r) => setTimeout(r, delayMs));
 
           try {
             await sock.sendMessage(target, { text: content });
 
-            // Beritahu Google Apps Script bahwa pesan berhasil terkirim
+            // Laporkan balik ke Google Apps Script bahwa pesan terkirim
             await fetch(GAS_API_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -622,7 +698,7 @@ async function startBroadcastQueueWorker() {
         }
       }
     } catch (workerErr) {
-      // Silent catch jika request jaringan mengalami interupsi sementara
+      // Abaikan jika request timeout
     }
   }, 60000);
 }
@@ -633,9 +709,18 @@ server.listen(PORT, () => {
   console.log(' Port       :', PORT);
   console.log(' Client ID  :', CLIENT_ID);
   console.log(' AI Model   :', GEMINI_MODEL);
-  console.log(' WebSocket  : Enabled (Socket.IO v4)');
+  console.log(' Session Dir:', SESSION_DIR);
   console.log(' Live QR    : http://localhost:' + PORT + '/qr');
   console.log('====================================================');
-  connectToWhatsApp(false);
+
+  const existingSession = hasExistingSession();
+  if (existingSession) {
+    console.log(`[Session Startup]: Sesi terdaftar ditemukan untuk [${CLIENT_ID}]. Memulihkan koneksi WhatsApp...`);
+    connectToWhatsApp(false, false);
+  } else {
+    console.log(`[Session Startup]: Belum ada sesi terdaftar untuk [${CLIENT_ID}]. Bot siaga menunggu pemindaian QR.`);
+    botStatus = 'DISCONNECTED';
+  }
+
   startBroadcastQueueWorker();
 });

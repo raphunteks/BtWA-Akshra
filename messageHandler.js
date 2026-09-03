@@ -45,7 +45,7 @@ async function syncLogToGAS(gasApiUrl, payload) {
       })
     }).catch(() => {});
   } catch (err) {
-    // Abaikan error jaringan logging agar alur percakapan bot tidak terhambat
+    // Abaikan error jaringan logging agar alur pesan bot tidak terhambat
   }
 }
 

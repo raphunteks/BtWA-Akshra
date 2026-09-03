@@ -4,6 +4,7 @@
  * ============================================================================
  * Mengelola Express Server, Real-Time Socket.IO Server untuk Live QR Streaming,
  * Baileys Multi-Device Engine dengan Session Guard Anti-Loop Reconnect,
+ * QR Pairing Push Notification Engine ke Webhook GAS & Web Browser,
  * REST API Dispatcher Pesan, dan Background Broadcast Worker.
  * ============================================================================
  */
@@ -56,6 +57,7 @@ let botStatus = 'DISCONNECTED'; // 'DISCONNECTED' | 'SCAN_QR' | 'CONNECTED'
 let currentQrRaw = null;
 let currentQrDataUrl = null;
 let isInitializing = false;
+let lastQrNotificationTime = 0;
 const serverStartTime = Date.now();
 
 // Logger Silent agar log output Railway tetap bersih dari noise data stream Baileys
@@ -71,7 +73,6 @@ function hasExistingSession() {
     if (!fs.existsSync(credsPath)) return false;
     const rawData = fs.readFileSync(credsPath, 'utf8');
     const parsed = JSON.parse(rawData);
-    // Baileys menyimpan flag registered: true atau properti user/me saat berhasil login
     return Boolean(parsed && (parsed.registered === true || parsed.me));
   } catch (err) {
     return false;
@@ -89,6 +90,28 @@ function cleanSessionDirectory() {
     }
   } catch (err) {
     console.error('[Auth Sesi]: Gagal membersihkan direktori sesi:', err.message);
+  }
+}
+
+/**
+ * Mengirimkan Push Notification asinkron ke Google Apps Script (GAS) saat ada event sistem krusial
+ * (misal: QR Code baru siap dipindai, bot berhasil terhubung, atau sesi logout).
+ */
+async function notifyGasSystem(action, payload) {
+  if (!GAS_API_URL) return;
+  try {
+    fetch(GAS_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: action,
+        clientId: CLIENT_ID,
+        timestamp: new Date().toISOString(),
+        ...payload
+      })
+    }).catch(() => {});
+  } catch (e) {
+    // Abaikan kegagalan jaringan push log agar operasional socket Baileys tidak tertahan
   }
 }
 
@@ -130,20 +153,18 @@ io.on('connection', (socket) => {
         timestamp: Date.now()
       });
     } else {
-      // Jika bot belum aktif dan belum ada QR, picu pembuatan koneksi secara aman
       connectToWhatsApp(false, true);
     }
   });
 
   socket.on('disconnect', () => {
-    // Sesi socket client terputus
+    // Client websocket terputus secara normal
   });
 });
 
 /**
- * Inisialisasi engine Baileys dengan proteksi Session Guard Anti-Loop Reconnect.
- * @param {boolean} forceClean - Bersihkan kredensial sebelum inisialisasi.
- * @param {boolean} isUserTriggered - Diinisiasi atas permintaan pengguna/web (misal scan QR).
+ * Inisialisasi engine Baileys dengan proteksi Session Guard Anti-Loop Reconnect
+ * dan modul QR Pairing Push Notification.
  */
 async function connectToWhatsApp(forceClean = false, isUserTriggered = false) {
   if (isInitializing) {
@@ -156,7 +177,7 @@ async function connectToWhatsApp(forceClean = false, isUserTriggered = false) {
   // GUARD UTAMA: Jika tidak ada sesi tersimpan dan BUKAN dipicu oleh aksi pengguna,
   // jangan lakukan inisialisasi background untuk mencegah perulangan reconnect.
   if (!sessionAlreadyExists && !isUserTriggered && !forceClean) {
-    console.log(`[Session Guard]: Client ID [${CLIENT_ID}] belum memiliki sesi terdaftar. Menunggu trigger scan QR dari dashboard.`);
+    console.log(`[Session Guard]: Client ID [${CLIENT_ID}] belum memiliki sesi terdaftar. Siaga menunggu trigger scan QR.`);
     botStatus = 'DISCONNECTED';
     return;
   }
@@ -172,7 +193,6 @@ async function connectToWhatsApp(forceClean = false, isUserTriggered = false) {
       fs.mkdirSync(SESSION_DIR, { recursive: true });
     }
 
-    // Tutup socket lama secara bersih jika masih menggantung
     if (sock) {
       try {
         sock.ev.removeAllListeners();
@@ -228,14 +248,39 @@ async function connectToWhatsApp(forceClean = false, isUserTriggered = false) {
             }
           });
 
-          console.log('[QR Baileys]: Kode QR asli berhasil dibuat. Mengirimkan ke Socket.IO...');
+          console.log('[QR Baileys]: Kode QR asli berhasil dibuat. Mengirimkan Push Notification & Socket Event...');
 
+          // A. Pancarkan data QR ke browser dashboard secara real-time
           io.emit('qr', {
             qrDataUrl: currentQrDataUrl,
             qrRaw: qr,
             clientId: CLIENT_ID,
             timestamp: Date.now()
           });
+
+          // B. Pancarkan Event QR Pairing Push Notification ke seluruh browser dashboard
+          io.emit('qr_push_notification', {
+            type: 'QR_READY',
+            title: 'Kode QR WhatsApp Siap Di-scan!',
+            message: `Instance [${CLIENT_ID}] memerlukan pemindaian WhatsApp untuk pairing.`,
+            clientId: CLIENT_ID,
+            timestamp: Date.now(),
+            hasAudioAlert: true
+          });
+
+          // C. Laporkan ke Google Apps Script (Throttled per 30 detik agar tidak spam)
+          const now = Date.now();
+          if (now - lastQrNotificationTime > 30000) {
+            lastQrNotificationTime = now;
+            notifyGasSystem('syncChatLog', {
+              senderNumber: 'SYSTEM_' + CLIENT_ID,
+              receiverNumber: 'ADMIN',
+              messageType: 'SYSTEM_ALERT',
+              content: `[QR PUSH NOTIFICATION] Kode QR WhatsApp baru tersedia untuk instance [${CLIENT_ID}]. Silakan scan di dashboard.`,
+              status: 'READY'
+            });
+          }
+
         } catch (err) {
           console.error('[QR Generation Error]:', err.message);
         }
@@ -261,9 +306,8 @@ async function connectToWhatsApp(forceClean = false, isUserTriggered = false) {
         });
 
         // KASUS A: Belum pernah ada sesi tersimpan (Client baru / belum scan)
-        // DILARANG melakukan reconnect otomatis agar terminal tidak spam loop!
         if (!sessionRegistered) {
-          console.log('[Session Guard]: Instance belum terautentikasi. Menghentikan reconnect otomatis. Menunggu scan QR berikutnya.');
+          console.log('[Session Guard]: Instance belum terautentikasi. Menghentikan reconnect otomatis.');
           return;
         }
 
@@ -271,10 +315,26 @@ async function connectToWhatsApp(forceClean = false, isUserTriggered = false) {
         if (statusCode === DisconnectReason.loggedOut) {
           console.log('[Logged Out]: Kredensial telah logout dari perangkat ponsel. Membersihkan sesi...');
           cleanSessionDirectory();
+          
+          io.emit('qr_push_notification', {
+            type: 'SESSION_LOGGED_OUT',
+            title: 'Sesi WhatsApp Terputus',
+            message: `Instance [${CLIENT_ID}] telah logout dari perangkat. Klik Pindai QR untuk menghubungkan kembali.`,
+            clientId: CLIENT_ID,
+            timestamp: Date.now()
+          });
+
+          notifyGasSystem('syncChatLog', {
+            senderNumber: 'SYSTEM_' + CLIENT_ID,
+            receiverNumber: 'ADMIN',
+            messageType: 'SYSTEM_ALERT',
+            content: `[SESSION LOGOUT] Instance [${CLIENT_ID}] terputus dari ponsel. Menunggu pendaftaran ulang.`,
+            status: 'DISCONNECTED'
+          });
           return;
         }
 
-        // KASUS C: Sesi valid ada, tetapi koneksi terputus sementara (jaringan/restart server)
+        // KASUS C: Sesi valid ada, koneksi terputus sementara
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         if (shouldReconnect && sessionRegistered) {
           console.log('[Auto-Reconnect]: Sesi valid terdeteksi. Menghubungkan ulang dalam 5 detik...');
@@ -294,11 +354,28 @@ async function connectToWhatsApp(forceClean = false, isUserTriggered = false) {
         console.log(' Phone      :', sock?.user?.id || 'Connected');
         console.log('====================================================');
 
+        // Pancarkan Push Notification Sukses Pairing ke browser dashboard
         io.emit('ready', {
           clientId: CLIENT_ID,
           status: 'CONNECTED',
           message: 'Sesi WhatsApp Baileys aktif dan terverifikasi',
           user: sock?.user
+        });
+
+        io.emit('qr_push_notification', {
+          type: 'PAIRING_SUCCESS',
+          title: 'WhatsApp Berhasil Terhubung!',
+          message: `Instance [${CLIENT_ID}] aktif melayani konsultasi pasien.`,
+          clientId: CLIENT_ID,
+          timestamp: Date.now()
+        });
+
+        notifyGasSystem('syncChatLog', {
+          senderNumber: 'SYSTEM_' + CLIENT_ID,
+          receiverNumber: 'ADMIN',
+          messageType: 'SYSTEM_ALERT',
+          content: `[BOT CONNECTED] Instance [${CLIENT_ID}] sukses terhubung ke WhatsApp nomor: ${sock?.user?.id || 'Aktif'}.`,
+          status: 'CONNECTED'
         });
       }
     });
@@ -316,7 +393,6 @@ async function connectToWhatsApp(forceClean = false, isUserTriggered = false) {
   } catch (error) {
     isInitializing = false;
     console.error('[Baileys Init Error]:', error);
-    // Hanya retry jika memang memiliki sesi terdaftar
     if (hasExistingSession()) {
       setTimeout(() => connectToWhatsApp(false, false), 10000);
     }
@@ -341,7 +417,7 @@ app.get('/', (req, res) => {
 app.get('/api/qr', (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
 
-  // Jika bot belum aktif dan belum ada QR, trigger pembuatan QR atas permintaan API
+  // Trigger pembuatan QR jika bot berstatus DISCONNECTED dan belum ada QR
   if (botStatus === 'DISCONNECTED' && !currentQrDataUrl && !isInitializing) {
     connectToWhatsApp(false, true);
   }
@@ -396,7 +472,6 @@ app.all(['/reset', '/api/reset-session'], async (req, res) => {
 app.get('/qr', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
 
-  // Jika belum aktif, picu pembuatan QR atas permintaan user membuka halaman ini
   if (botStatus === 'DISCONNECTED' && !currentQrDataUrl && !isInitializing) {
     connectToWhatsApp(false, true);
   }
@@ -422,9 +497,9 @@ app.get('/qr', (req, res) => {
           color: #0f172a;
         }
         .card {
-          background: rgba(255, 255, 255, 0.88);
+          background: rgba(255, 255, 255, 0.9);
           backdrop-filter: blur(20px);
-          border: 1px solid rgba(255, 255, 255, 0.9);
+          border: 1px solid rgba(255, 255, 255, 0.95);
           border-radius: 24px;
           padding: 35px 30px;
           max-width: 420px;
@@ -528,11 +603,23 @@ app.get('/qr', (req, res) => {
           margin-bottom: 20px;
         }
         .success-box svg { width: 56px; height: 56px; fill: #10b981; margin-bottom: 10px; }
+        .notif-banner {
+          display: none;
+          background: #e0f2fe;
+          border: 1px solid #bae6fd;
+          color: #0369a1;
+          font-size: 12px;
+          padding: 8px 12px;
+          border-radius: 10px;
+          margin-bottom: 14px;
+          font-weight: 600;
+        }
       </style>
     </head>
     <body>
       <div class="card">
         <div class="badge" id="statusBadge"><span class="dot" id="statusDot"></span> <span id="statusText">Memuat Status...</span></div>
+        <div class="notif-banner" id="notifBanner">🔔 Push Notification Aktif</div>
         
         <h2 id="mainTitle">Pindai Kode QR</h2>
         <p class="desc" id="subTitle">Buka WhatsApp di ponsel &gt; Perangkat Tertaut &gt; Tautkan Perangkat.</p>
@@ -569,6 +656,7 @@ app.get('/qr', (req, res) => {
         const qrImg = document.getElementById('qrImg');
         const qrWrapper = document.getElementById('qrWrapper');
         const successBox = document.getElementById('successBox');
+        const notifBanner = document.getElementById('notifBanner');
 
         socket.on('qr', function(data) {
           if (data && data.qrDataUrl) {
@@ -579,6 +667,14 @@ app.get('/qr', (req, res) => {
             statusText.innerText = 'Siap Di-scan';
             mainTitle.innerText = 'Pindai Kode QR WhatsApp';
             subTitle.innerText = 'Arahkan kamera WhatsApp ponsel Anda ke kode di bawah:';
+          }
+        });
+
+        socket.on('qr_push_notification', function(notif) {
+          if (notif) {
+            notifBanner.style.display = 'block';
+            notifBanner.innerText = '🔔 ' + notif.title + ' - ' + notif.message;
+            setTimeout(() => { notifBanner.style.display = 'none'; }, 6000);
           }
         });
 
@@ -682,7 +778,6 @@ async function startBroadcastQueueWorker() {
           try {
             await sock.sendMessage(target, { text: content });
 
-            // Laporkan balik ke Google Apps Script bahwa pesan terkirim
             await fetch(GAS_API_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -698,7 +793,7 @@ async function startBroadcastQueueWorker() {
         }
       }
     } catch (workerErr) {
-      // Abaikan jika request timeout
+      // Abaikan request timeout
     }
   }, 60000);
 }
@@ -709,7 +804,7 @@ server.listen(PORT, () => {
   console.log(' Port       :', PORT);
   console.log(' Client ID  :', CLIENT_ID);
   console.log(' AI Model   :', GEMINI_MODEL);
-  console.log(' Session Dir:', SESSION_DIR);
+  console.log(' Push Alert : Active via Webhook & Socket.IO');
   console.log(' Live QR    : http://localhost:' + PORT + '/qr');
   console.log('====================================================');
 

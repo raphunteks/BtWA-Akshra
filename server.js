@@ -2,18 +2,20 @@
  * ============================================================================
  * SERVER.JS - ENTRY POINT BACKEND WA BOT MULTI-CLIENT (RAILWAY INSTANCE)
  * ============================================================================
- * Mengelola Express Server, Sesi Koneksi Baileys Multi-Device,
- * Rendering Live QR Scanner, Endpoint Dispatcher Pesan, dan Queue Worker.
+ * Mengelola Express Server, Real-Time Socket.IO Server untuk Live QR Streaming,
+ * Sesi Koneksi Baileys Multi-Device, Endpoint Dispatcher Pesan, dan Queue Worker.
  * ============================================================================
  */
 
 require('dotenv').config();
+const http = require('http');
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
+const { Server } = require('socket.io');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -23,7 +25,6 @@ const {
 
 const { handleIncomingMessage, sanitizeNumber } = require('./messageHandler');
 
-// Konfigurasi Environment & Konfigurasi Default
 const PORT = process.env.PORT || 3000;
 const CLIENT_ID = process.env.CLIENT_ID || 'CLI-0001';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
@@ -32,25 +33,55 @@ const GAS_API_URL = process.env.GAS_API_URL || '';
 const SYNC_SECRET_TOKEN = process.env.SYNC_SECRET_TOKEN || 'ZETTBOS_CLINIC_SECRET_2026';
 const SESSION_DIR = process.env.SESSION_DIR || path.join(__dirname, 'auth_info_baileys');
 
-// Inisialisasi Express
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Variabel Status Internal Bot
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  },
+  transports: ['websocket', 'polling']
+});
+
 let sock = null;
 let botStatus = 'DISCONNECTED'; // 'DISCONNECTED' | 'SCAN_QR' | 'CONNECTED'
 let currentQrRaw = null;
 let currentQrDataUrl = null;
 const serverStartTime = Date.now();
 
-// Logger Silent agar Terminal Railway tetap bersih
+// Logger Silent agar output log di terminal Railway tetap rapi dan terukur
 const logger = pino({ level: 'silent' });
 
-/**
- * Inisialisasi dan Manajemen Koneksi Baileys
- */
+io.on('connection', (socket) => {
+  // Kirim status saat ini ke client frontend (index.html) yang baru terhubung
+  if (botStatus === 'CONNECTED') {
+    socket.emit('ready', {
+      clientId: CLIENT_ID,
+      status: 'CONNECTED',
+      message: 'WhatsApp Bot sudah aktif dan terautentikasi'
+    });
+  } else if (botStatus === 'SCAN_QR' && currentQrDataUrl) {
+    socket.emit('qr', {
+      qrDataUrl: currentQrDataUrl,
+      qrRaw: currentQrRaw,
+      clientId: CLIENT_ID
+    });
+  } else {
+    socket.emit('status', {
+      status: botStatus,
+      clientId: CLIENT_ID
+    });
+  }
+
+  socket.on('disconnect', () => {
+    // Sesi socket client ditutup dengan aman
+  });
+});
+
 async function connectToWhatsApp() {
   try {
     if (!fs.existsSync(SESSION_DIR)) {
@@ -69,10 +100,8 @@ async function connectToWhatsApp() {
       syncFullHistory: false
     });
 
-    // Event Credential Update
     sock.ev.on('creds.update', saveCreds);
 
-    // Event Connection Update (QR Code, Connect, Disconnect)
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -88,6 +117,13 @@ async function connectToWhatsApp() {
               light: '#ffffff'
             }
           });
+
+          // Pancarkan event 'qr' secara instan ke browser frontend via Socket.IO
+          io.emit('qr', {
+            qrDataUrl: currentQrDataUrl,
+            qrRaw: qr,
+            clientId: CLIENT_ID
+          });
         } catch (err) {
           console.error('[QR Generation Error]:', err.message);
         }
@@ -100,30 +136,36 @@ async function connectToWhatsApp() {
         currentQrRaw = null;
         currentQrDataUrl = null;
 
-        console.log('[Connection Closed]: Alasan code:', statusCode, '| Reconnect:', shouldReconnect);
+        console.log('[Connection Closed]: Kode status:', statusCode, '| Reconnect:', shouldReconnect);
+        io.emit('status', { status: 'DISCONNECTED', clientId: CLIENT_ID });
 
         if (statusCode === DisconnectReason.loggedOut) {
-          console.log('[Logged Out]: Membersihkan kredensial lama...');
+          console.log('[Logged Out]: Membersihkan kredensial sesi lama...');
           try {
             fs.rmSync(SESSION_DIR, { recursive: true, force: true });
           } catch (e) {
             console.error('[Clean Sesi Gagal]:', e.message);
           }
-          // Restart koneksi untuk memicu QR baru
           setTimeout(connectToWhatsApp, 3000);
         } else if (shouldReconnect) {
-          // Exponential backoff reconnect
           setTimeout(connectToWhatsApp, 5000);
         }
       } else if (connection === 'open') {
         botStatus = 'CONNECTED';
         currentQrRaw = null;
         currentQrDataUrl = null;
+
         console.log('[Connection Open]: Bot WA Zettbos Clinic Terhubung Penuh!');
+
+        // Pancarkan event 'ready' ke seluruh client frontend (index.html)
+        io.emit('ready', {
+          clientId: CLIENT_ID,
+          status: 'CONNECTED',
+          message: 'Sesi WhatsApp Baileys aktif dan terverifikasi'
+        });
       }
     });
 
-    // Event Pesan Masuk
     sock.ev.on('messages.upsert', async (m) => {
       await handleIncomingMessage(sock, m, {
         clientId: CLIENT_ID,
@@ -140,13 +182,6 @@ async function connectToWhatsApp() {
   }
 }
 
-/**
- * ============================================================================
- * REST API ENDPOINTS
- * ============================================================================
- */
-
-// 1. Health-Check Monitor Endpoint
 app.get('/', (req, res) => {
   const uptimeSeconds = Math.floor((Date.now() - serverStartTime) / 1000);
   res.status(200).json({
@@ -155,11 +190,11 @@ app.get('/', (req, res) => {
     botStatus: botStatus,
     uptime: uptimeSeconds + 's',
     model: GEMINI_MODEL,
+    hasSocketIo: true,
     timestamp: new Date().toISOString()
   });
 });
 
-// 2. Live QR Scanner Endpoint (Menyajikan visual QR atau status terkoneksi)
 app.get('/qr', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
 
@@ -170,10 +205,10 @@ app.get('/qr', (req, res) => {
       <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Bot Connected - Zettbos Medical</title>
+        <title>Bot Connected - NovaCare Clinic</title>
         <style>
           body { font-family: 'Segoe UI', sans-serif; background: #f0f7fa; color: #0f172a; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-          .card { background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(16px); padding: 35px 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0, 180, 216, 0.15); text-align: center; border: 1px solid rgba(255, 255, 255, 0.9); max-width: 360px; width: 90%; }
+          .card { background: rgba(255, 255, 255, 0.88); backdrop-filter: blur(16px); padding: 35px 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0, 180, 216, 0.15); text-align: center; border: 1px solid rgba(255, 255, 255, 0.9); max-width: 360px; width: 90%; }
           .badge { display: inline-flex; align-items: center; gap: 8px; background: #e0f2fe; color: #0077b6; padding: 6px 16px; border-radius: 50px; font-weight: 600; font-size: 13px; margin-bottom: 15px; }
           .dot { width: 10px; height: 10px; border-radius: 50%; background: #10b981; box-shadow: 0 0 10px #10b981; }
           h2 { margin: 0 0 10px; font-size: 20px; color: #0f172a; }
@@ -199,10 +234,10 @@ app.get('/qr', (req, res) => {
         <meta charset="UTF-8">
         <meta http-equiv="refresh" content="20">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Scan QR Code - Zettbos Medical Bot</title>
+        <title>Scan QR Code - NovaCare Medical Bot</title>
         <style>
           body { font-family: 'Segoe UI', sans-serif; background: #f0f7fa; color: #0f172a; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-          .card { background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(16px); padding: 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0, 180, 216, 0.15); text-align: center; border: 1px solid rgba(255, 255, 255, 0.9); max-width: 360px; width: 90%; }
+          .card { background: rgba(255, 255, 255, 0.88); backdrop-filter: blur(16px); padding: 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0, 180, 216, 0.15); text-align: center; border: 1px solid rgba(255, 255, 255, 0.9); max-width: 360px; width: 90%; }
           .qr-box { background: #ffffff; padding: 15px; border-radius: 14px; display: inline-block; border: 1px solid #e2e8f0; margin: 15px 0; }
           .qr-box img { width: 220px; height: 220px; display: block; }
           h2 { margin: 0 0 5px; font-size: 19px; color: #0f172a; }
@@ -224,7 +259,6 @@ app.get('/qr', (req, res) => {
     `);
   }
 
-  // Jika status sedang DISCONNECTED / Menginisialisasi
   res.send(`
     <!DOCTYPE html>
     <html lang="id">
@@ -232,10 +266,10 @@ app.get('/qr', (req, res) => {
       <meta charset="UTF-8">
       <meta http-equiv="refresh" content="5">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Menginisialisasi - Zettbos Medical Bot</title>
+      <title>Menginisialisasi - NovaCare Medical Bot</title>
       <style>
         body { font-family: 'Segoe UI', sans-serif; background: #f0f7fa; color: #0f172a; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-        .card { background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(16px); padding: 35px 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0, 180, 216, 0.15); text-align: center; border: 1px solid rgba(255, 255, 255, 0.9); max-width: 360px; width: 90%; }
+        .card { background: rgba(255, 255, 255, 0.88); backdrop-filter: blur(16px); padding: 35px 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0, 180, 216, 0.15); text-align: center; border: 1px solid rgba(255, 255, 255, 0.9); max-width: 360px; width: 90%; }
         h2 { margin: 0 0 10px; font-size: 18px; color: #0f172a; }
         p { margin: 0; color: #64748b; font-size: 13px; }
       </style>
@@ -250,7 +284,6 @@ app.get('/qr', (req, res) => {
   `);
 });
 
-// 3. Endpoint Dispatcher Pengiriman Pesan (Dihubungi oleh GAS)
 app.post('/api/send-message', async (req, res) => {
   try {
     const authHeader = req.headers['authorization'] || req.headers['x-sync-token'];
@@ -283,17 +316,11 @@ app.post('/api/send-message', async (req, res) => {
   }
 });
 
-/**
- * ============================================================================
- * BACKGROUND QUEUE WORKER (ANTREAN BROADCAST AUTO-DISPATCHER)
- * ============================================================================
- */
 async function startBroadcastQueueWorker() {
   setInterval(async () => {
     if (botStatus !== 'CONNECTED' || !sock || !GAS_API_URL) return;
 
     try {
-      // Ambil antrean broadcast berstatus PENDING dari Google Apps Script
       const fetchUrl = GAS_API_URL + '?action=getBroadcastQueue&page=1&limit=5&status=PENDING';
       const response = await fetch(fetchUrl);
       const json = await response.json();
@@ -304,14 +331,14 @@ async function startBroadcastQueueWorker() {
           const target = sanitizeNumber(item.targetNumber);
           const content = item.content;
 
-          // Jitter Delay acak 6 - 11 detik agar aman dari deteksi spam/banned
+          // Jitter Delay acak 6 - 11 detik per pesan untuk pencegahan banned WhatsApp
           const delayMs = Math.floor(Math.random() * (11000 - 6000 + 1)) + 6000;
           await new Promise((r) => setTimeout(r, delayMs));
 
           try {
             await sock.sendMessage(target, { text: content });
 
-            // Beritahu GAS bahwa pesan telah berhasil dikirim
+            // Beritahu Google Apps Script bahwa pesan berhasil terkirim
             await fetch(GAS_API_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -320,25 +347,25 @@ async function startBroadcastQueueWorker() {
                 queueId: queueId
               })
             });
-            console.log('[Broadcast Sent]: Sukses kirim antrean ID:', queueId, 'ke:', target);
+            console.log('[Broadcast Sent]: Sukses mengirim antrean ID:', queueId, 'ke:', target);
           } catch (sendErr) {
             console.error('[Broadcast Item Failed]:', queueId, sendErr.message);
           }
         }
       }
     } catch (workerErr) {
-      // Silent pass jika request timeout
+      // Silent catch jika request jaringan mengalami interupsi sementara
     }
-  }, 60000); // Eksekusi setiap 60 detik
+  }, 60000);
 }
 
-// Menjalankan Server & Koneksi Baileys
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log('====================================================');
-  console.log(' ZETTBOS MEDICAL CLINIC WA BOT ENGINE IS RUNNING');
+  console.log(' NOVACARE CLINIC WA BOT & SOCKET.IO ENGINE RUNNING');
   console.log(' Port       :', PORT);
   console.log(' Client ID  :', CLIENT_ID);
   console.log(' AI Model   :', GEMINI_MODEL);
+  console.log(' WebSocket  : Enabled (Socket.IO v4)');
   console.log('====================================================');
   connectToWhatsApp();
   startBroadcastQueueWorker();
